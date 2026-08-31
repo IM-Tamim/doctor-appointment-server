@@ -29,21 +29,42 @@ dotenv.config();
   }
 }
 const app = express();
-// In production only the deployed client may call this API. `origin: true`
-// reflects whatever Origin the caller sends, which is effectively "allow all".
+
+// Origins are compared literally against the browser's Origin header, which
+// never has a trailing slash. CLIENT_URL="https://site.app/" would silently
+// match nothing, so normalise both sides.
+const normaliseOrigin = (value) => (value || "").trim().replace(/\/+$/, "");
+
 const allowedOrigins = [
-  process.env.CLIENT_URL,
-  ...(process.env.EXTRA_ORIGINS || "").split(",").map((o) => o.trim()).filter(Boolean),
+  normaliseOrigin(process.env.CLIENT_URL),
+  ...(process.env.EXTRA_ORIGINS || "").split(",").map(normaliseOrigin),
 ].filter(Boolean);
+
+// Fail loudly at boot instead of silently rejecting every browser request.
+// Without CLIENT_URL the allowlist is empty AND the JWKS URL below is
+// "undefined/api/auth/jwks", so the whole app looks broken for two reasons at
+// once — which is exactly the failure this guard is here to make obvious.
+if (process.env.NODE_ENV === "production" && allowedOrigins.length === 0) {
+  console.error(
+    "[config] FATAL: CLIENT_URL is not set. In production every browser request " +
+    "will be blocked by CORS and every JWT will fail to verify. Set CLIENT_URL " +
+    "to your deployed frontend origin, e.g. https://your-site.netlify.app"
+  );
+}
 
 app.use(cors({
   origin: (origin, cb) => {
     // Same-origin/curl/server-to-server requests send no Origin header.
     if (!origin) return cb(null, true);
     if (process.env.NODE_ENV !== "production") return cb(null, true);
-    return allowedOrigins.includes(origin)
-      ? cb(null, true)
-      : cb(new Error(`Origin ${origin} is not allowed by CORS`));
+    if (allowedOrigins.includes(normaliseOrigin(origin))) return cb(null, true);
+
+    // Deny by *omitting* the CORS headers rather than throwing. Throwing here
+    // turns a policy decision into an unhandled error, and the preflight comes
+    // back as a 500 — which reads like the server crashed instead of "this
+    // origin isn't on the list".
+    console.warn(`[cors] blocked origin: ${origin} (allowed: ${allowedOrigins.join(", ") || "none"})`);
+    return cb(null, false);
   },
   methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
@@ -74,9 +95,24 @@ app.use(generalLimiter);
 const port = process.env.PORT || 8000;
 const uri = process.env.MONGO_URI;
 
-const JWKS = createRemoteJWKSet(
-  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`)
-);
+// Public keys are fetched from the client app, so this URL is only valid if
+// CLIENT_URL points at the deployed frontend.
+const JWKS_URL = `${normaliseOrigin(process.env.CLIENT_URL)}/api/auth/jwks`;
+
+// Built lazily and defensively. `new URL()` on a missing or malformed
+// CLIENT_URL throws ERR_INVALID_URL at import time, which killed the whole
+// process before it could serve even the public routes or /health — the worst
+// possible way to report a one-line config mistake.
+let JWKS = null;
+try {
+  JWKS = createRemoteJWKSet(new URL(JWKS_URL));
+} catch (err) {
+  console.error(
+    `[auth] CLIENT_URL is missing or malformed, so JWKS is unavailable ` +
+    `(tried "${JWKS_URL}"). Public routes still work; anything needing a login ` +
+    `will return 503 until CLIENT_URL is set to the deployed frontend origin.`
+  );
+}
 
 const verifyToken = async (req, res, next) => {
   const authHeader = req?.headers.authorization;
@@ -87,14 +123,66 @@ const verifyToken = async (req, res, next) => {
   if (!token) {
     return res.status(401).json({ message: "Unauthorized" });
   }
+  if (!JWKS) {
+    return res.status(503).json({
+      message:
+        "Auth is misconfigured on the server: CLIENT_URL is not set to a valid " +
+        "frontend origin, so token signing keys can't be fetched.",
+    });
+  }
+
   try {
     const { payload } = await jwtVerify(token, JWKS);
     req.user = payload; // { id, email, name, role, status }
     next();
   } catch (error) {
+    // A blanket 403 hid a config problem behind what looks like a rejected
+    // login: if the JWKS endpoint is unreachable, EVERY token fails here no
+    // matter how valid it is. Separate the two so the cause is visible.
+    const isFetchProblem =
+      error?.code === "ERR_JWKS_TIMEOUT" ||
+      error?.code === "ERR_JWKS_NO_MATCHING_KEY" ||
+      /fetch|network|ENOTFOUND|ECONNREFUSED|Invalid URL|failed to fetch/i.test(error?.message || "");
+
+    if (isFetchProblem) {
+      console.error(`[auth] cannot verify tokens — JWKS fetch failed from ${JWKS_URL}: ${error.message}`);
+      return res.status(503).json({
+        message:
+          "Auth is misconfigured on the server: the token signing keys could not be fetched. " +
+          "Check that CLIENT_URL matches the deployed frontend.",
+      });
+    }
+
     return res.status(403).json({ message: "Forbidden" });
   }
 };
+
+/**
+ * Config probe. Deliberately reports only whether things are *set* and whether
+ * the JWKS endpoint answers — never the values themselves.
+ */
+app.get("/health", async (req, res) => {
+  let jwks = "unknown";
+  try {
+    // Generous: a cold serverless frontend can take several seconds to wake,
+    // and a false "unreachable" here would send you chasing the wrong problem.
+    const r = await fetch(JWKS_URL, { signal: AbortSignal.timeout(12000) });
+    jwks = r.ok ? "reachable" : `HTTP ${r.status}`;
+  } catch (err) {
+    jwks = `unreachable (${err.message})`;
+  }
+
+  res.json({
+    ok: allowedOrigins.length > 0 && jwks === "reachable",
+    nodeEnv: process.env.NODE_ENV || "(unset)",
+    clientUrlSet: Boolean(process.env.CLIENT_URL),
+    allowedOrigins,
+    jwksUrl: JWKS_URL,
+    jwks,
+    mongoUriSet: Boolean(process.env.MONGO_URI),
+    emailConfigured: Boolean(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD),
+  });
+});
 
 // ────────────────────────────────────────────────────────────
 // Booking validation
