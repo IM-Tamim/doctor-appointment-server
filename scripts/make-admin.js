@@ -14,7 +14,7 @@ if (!email) {
   const client = new MongoClient(process.env.MONGO_URI);
   try {
     await client.connect();
-    const db = client.db("DocAppoint");
+    const db = client.db(process.env.DB_NAME || "DocAppoint");
     const result = await db.collection("user").updateOne(
       { email },
       { $set: { role: "admin", status: "active" } }

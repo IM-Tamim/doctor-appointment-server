@@ -6,14 +6,31 @@ const cors = require("cors");
 const { createRemoteJWKSet, jwtVerify } = require("jose-cjs");
 const requireRole = require("./middleware/requireRole");
 const { notify } = require("./lib/notify");
+const { createAppointmentService } = require("./lib/appointments");
+const { createDownloads } = require("./lib/downloads");
 const rateLimit = require("express-rate-limit");
+const compression = require("compression");
+const {
+  WEEKDAYS,
+  PER_HOUR_OPTIONS,
+  isDate,
+  isTime,
+  slotMinutesOf,
+  perHourOf,
+  weekdayOf,
+  clinicNow,
+  leaveDatesOf,
+  daySlots,
+  normalizeSessions,
+  addDays,
+} = require("./lib/schedule");
+const crypto = require("crypto");
+
+// Jitsi Meet needs no account or API key: an unguessable room name is the link.
+const newMeetingUrl = () => `https://meet.jit.si/docappoint-${crypto.randomBytes(9).toString("hex")}`;
 
 dotenv.config();
 
-// Some Windows setups (extra VPN/virtual adapters) stop Node's c-ares resolver from
-// reading the system DNS config; it then falls back to 127.0.0.1, where nothing is
-// listening, and the mongodb+srv:// SRV lookup dies with ECONNREFUSED. Only kicks in
-// when the resolver is loopback-only, so a healthy machine is left alone.
 {
   const dns = require("dns");
   const loopbackOnly = dns
@@ -30,9 +47,6 @@ dotenv.config();
 }
 const app = express();
 
-// Origins are compared literally against the browser's Origin header, which
-// never has a trailing slash. CLIENT_URL="https://site.app/" would silently
-// match nothing, so normalise both sides.
 const normaliseOrigin = (value) => (value || "").trim().replace(/\/+$/, "");
 
 const allowedOrigins = [
@@ -40,10 +54,6 @@ const allowedOrigins = [
   ...(process.env.EXTRA_ORIGINS || "").split(",").map(normaliseOrigin),
 ].filter(Boolean);
 
-// Fail loudly at boot instead of silently rejecting every browser request.
-// Without CLIENT_URL the allowlist is empty AND the JWKS URL below is
-// "undefined/api/auth/jwks", so the whole app looks broken for two reasons at
-// once — which is exactly the failure this guard is here to make obvious.
 if (process.env.NODE_ENV === "production" && allowedOrigins.length === 0) {
   console.error(
     "[config] FATAL: CLIENT_URL is not set. In production every browser request " +
@@ -54,27 +64,21 @@ if (process.env.NODE_ENV === "production" && allowedOrigins.length === 0) {
 
 app.use(cors({
   origin: (origin, cb) => {
-    // Same-origin/curl/server-to-server requests send no Origin header.
     if (!origin) return cb(null, true);
     if (process.env.NODE_ENV !== "production") return cb(null, true);
     if (allowedOrigins.includes(normaliseOrigin(origin))) return cb(null, true);
 
-    // Deny by *omitting* the CORS headers rather than throwing. Throwing here
-    // turns a policy decision into an unhandled error, and the preflight comes
-    // back as a 500 — which reads like the server crashed instead of "this
-    // origin isn't on the list".
     console.warn(`[cors] blocked origin: ${origin} (allowed: ${allowedOrigins.join(", ") || "none"})`);
     return cb(null, false);
   },
-  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+  // PUT is used by saved doctors and the donor profile.
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
 
-// Cap the body so a huge payload can't be used to exhaust memory.
+app.use(compression());
 app.use(express.json({ limit: "100kb" }));
 
-// Booking and review endpoints write to the database on every call, so they get
-// a tighter budget than plain reads.
 const writeLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 20,
@@ -94,15 +98,12 @@ const generalLimiter = rateLimit({
 app.use(generalLimiter);
 const port = process.env.PORT || 8000;
 const uri = process.env.MONGO_URI;
+// Overridable so a scratch database can be seeded/tested without touching real data.
+const DB_NAME = process.env.DB_NAME || "DocAppoint";
 
-// Public keys are fetched from the client app, so this URL is only valid if
-// CLIENT_URL points at the deployed frontend.
+
 const JWKS_URL = `${normaliseOrigin(process.env.CLIENT_URL)}/api/auth/jwks`;
 
-// Built lazily and defensively. `new URL()` on a missing or malformed
-// CLIENT_URL throws ERR_INVALID_URL at import time, which killed the whole
-// process before it could serve even the public routes or /health — the worst
-// possible way to report a one-line config mistake.
 let JWKS = null;
 try {
   JWKS = createRemoteJWKSet(new URL(JWKS_URL));
@@ -133,12 +134,14 @@ const verifyToken = async (req, res, next) => {
 
   try {
     const { payload } = await jwtVerify(token, JWKS);
-    req.user = payload; // { id, email, name, role, status }
+    // Tokens minted before email verification existed carry no flag; only an
+    // explicit false blocks.
+    if (payload.emailVerified === false) {
+      return res.status(403).json({ message: "Please verify your email address before continuing." });
+    }
+    req.user = payload; // { id, email, name, role, status, emailVerified }
     next();
   } catch (error) {
-    // A blanket 403 hid a config problem behind what looks like a rejected
-    // login: if the JWKS endpoint is unreachable, EVERY token fails here no
-    // matter how valid it is. Separate the two so the cause is visible.
     const isFetchProblem =
       error?.code === "ERR_JWKS_TIMEOUT" ||
       error?.code === "ERR_JWKS_NO_MATCHING_KEY" ||
@@ -157,15 +160,9 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
-/**
- * Config probe. Deliberately reports only whether things are *set* and whether
- * the JWKS endpoint answers — never the values themselves.
- */
 app.get("/health", async (req, res) => {
   let jwks = "unknown";
   try {
-    // Generous: a cold serverless frontend can take several seconds to wake,
-    // and a false "unreachable" here would send you chasing the wrong problem.
     const r = await fetch(JWKS_URL, { signal: AbortSignal.timeout(12000) });
     jwks = r.ok ? "reachable" : `HTTP ${r.status}`;
   } catch (err) {
@@ -184,44 +181,73 @@ app.get("/health", async (req, res) => {
   });
 });
 
-// ────────────────────────────────────────────────────────────
 // Booking validation
-// ────────────────────────────────────────────────────────────
-
-const WEEKDAYS = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
 
 /**
- * A booking is only valid if the doctor actually works that weekday and
- * publishes that exact slot. The client shows a dropdown built from the same
- * data, but the dropdown is just UX — anyone can POST whatever they like, so
- * the real check has to live here.
+ * Checks a requested date + time against the doctor's sessions and leave days.
+ * Returns { error } or { serial } — the slot's 1-based position in the day.
+ * Whether the slot is already taken is left to the unique index.
  */
 const validateSlot = (doctor, dateStr, timeStr) => {
-  if (!dateStr || !timeStr) return "Appointment date and time are required.";
+  if (!dateStr || !timeStr) return { error: "Appointment date and time are required." };
+  if (!isDate(dateStr)) return { error: "Invalid appointment date." };
+  if (!isTime(timeStr)) return { error: "Invalid appointment time." };
 
-  const date = new Date(`${dateStr}T00:00:00`);
-  if (Number.isNaN(date.getTime())) return "Invalid appointment date.";
+  const now = clinicNow();
+  if (dateStr < now.date) return { error: "Appointment date cannot be in the past." };
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  if (date < today) return "Appointment date cannot be in the past.";
-
-  // A one-off day off (holiday, leave, conference) beats the weekly pattern.
-  if (Array.isArray(doctor.blockedDates) && doctor.blockedDates.includes(dateStr)) {
-    return `${doctor.name} is not available on ${dateStr}.`;
+  if (leaveDatesOf(doctor).includes(dateStr)) {
+    return { error: `${doctor.name} is on leave on ${dateStr}.` };
   }
 
-  const weekday = WEEKDAYS[date.getDay()];
-  const availability = Array.isArray(doctor.availability) ? doctor.availability : [];
-  const forDay = availability.find((a) => a.day === weekday);
+  const weekday = weekdayOf(dateStr);
+  const slots = daySlots(doctor, weekday);
+  if (slots.length === 0) return { error: `${doctor.name} does not consult on ${weekday}.` };
 
-  if (!forDay || !Array.isArray(forDay.slots) || forDay.slots.length === 0) {
-    return `${doctor.name} does not consult on ${weekday}.`;
+  const slot = slots.find((s) => s.time === timeStr);
+  if (!slot) return { error: `${timeStr} is not one of ${doctor.name}'s ${weekday} slots.` };
+  if (dateStr === now.date && timeStr <= now.time) return { error: "That time has already passed today." };
+
+  return { serial: slot.serial };
+};
+
+// Appointments that hold a slot. Cancelled ones (and expired payment holds)
+// flip isActive to false, which frees the slot under the unique index.
+const isDuplicateKey = (err) => err?.code === 11000;
+
+// User input goes into RegExp constructors for search; escape it so "C++" or
+// "(" can't throw or turn into a catastrophic pattern.
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Public listings never need reviewer emails, credential scans or rejection
+// notes — and dropping reviews keeps list payloads small.
+const PUBLIC_DOCTOR_PROJECTION = {
+  reviews: 0,
+  credentialImageUrl: 0,
+  rejectionReason: 0,
+  email: 0,
+};
+
+const CONSULTATION_TYPES = ["in-person", "online", "both"];
+
+// image = cover photo; imageCredit/imageSource = its author/licence and source page.
+const HOSPITAL_TEXT_FIELDS = ["name", "city", "address", "phone", "logo", "emergencyPhone", "image", "imageCredit", "imageSource"];
+
+const pickHospitalFields = (body = {}, { partial = false } = {}) => {
+  const out = {};
+  for (const key of HOSPITAL_TEXT_FIELDS) {
+    if (body[key] !== undefined) out[key] = String(body[key] ?? "").trim().slice(0, 300);
+    else if (!partial) out[key] = "";
   }
-  if (!forDay.slots.includes(timeStr)) {
-    return `${timeStr} is not one of ${doctor.name}'s ${weekday} slots (${forDay.slots.join(", ")}).`;
+  if (body.departments !== undefined) {
+    const list = Array.isArray(body.departments)
+      ? body.departments
+      : String(body.departments || "").split(",");
+    out.departments = [...new Set(list.map((d) => String(d).trim()).filter(Boolean))].slice(0, 40);
+  } else if (!partial) {
+    out.departments = [];
   }
-  return null;
+  return out;
 };
 
 const client = new MongoClient(uri, {
@@ -236,33 +262,315 @@ async function run() {
   try {
     await client.connect();
 
-    const db = client.db("DocAppoint");
+    const db = client.db(DB_NAME);
 
-    // Indexes are created once at boot and are no-ops if they already exist.
-    // Without these, every "my appointments" read and every double-booking
-    // check is a full collection scan.
     await Promise.all([
       db.collection("appointments").createIndex({ userEmail: 1, createdAt: -1 }),
       db.collection("appointments").createIndex({ doctorId: 1, appointmentDate: 1, appointmentTime: 1 }),
       db.collection("doctors").createIndex({ approvalStatus: 1 }),
       db.collection("doctors").createIndex({ userId: 1 }),
       db.collection("doctors").createIndex({ email: 1 }),
+      db.collection("doctors").createIndex({ hospitalId: 1 }),
+      // No text index on name/specialty: this client runs the Stable API in
+      // strict mode, which can neither create nor query $text indexes. Search
+      // uses a case-insensitive substring regex instead (see GET /doctors).
+      db.collection("hospitals").createIndex({ city: 1 }),
       db.collection("notifications").createIndex({ userId: 1, createdAt: -1 }),
+      db.collection("appointments").createIndex({ userId: 1, createdAt: -1 }),
+      db.collection("appointments").createIndex({ holdExpiresAt: 1 }, { sparse: true }),
+      db.collection("payments").createIndex({ appointmentId: 1 }),
+      db.collection("payments").createIndex({ createdAt: -1 }),
     ]).catch((err) => console.warn("Index creation skipped:", err.message));
     const doctorCollection = db.collection("doctors");
     const appointmentsCollection = db.collection("appointments");
     const notificationsCollection = db.collection("notifications");
+    const hospitalsCollection = db.collection("hospitals");
+    const paymentsCollection = db.collection("payments");
+    const settingsCollection = db.collection("settings");
     const userCollection = db.collection("user"); // Better Auth's collection name
 
-    // ────────────────────────────────────────────────────────────
+    // No double booking: at most one *active* appointment per doctor/date/time.
+    // Cancelling sets isActive=false, which takes the row out of the index and
+    // frees the slot. (Partial filters can't use $ne, hence a boolean flag.)
+    // Appointments created before the flag existed are backfilled first.
+    await appointmentsCollection
+      .updateMany({ isActive: { $exists: false } }, [
+        { $set: { isActive: { $ne: ["$status", "cancelled"] } } },
+      ])
+      .catch((err) => console.warn("isActive backfill skipped:", err.message));
+    await appointmentsCollection
+      .createIndex(
+        { doctorId: 1, appointmentDate: 1, appointmentTime: 1, isActive: 1 },
+        { name: "uniq_active_slot", unique: true, partialFilterExpression: { isActive: true } }
+      )
+      .catch((err) => console.warn("Unique slot index not created:", err.message));
+
+    const bookings = createAppointmentService({ db });
+    setInterval(() => bookings.releaseExpiredHolds().catch(() => {}), 60 * 1000).unref();
+
+    // Feature areas live in routes/*; they share these helpers.
+    const routeContext = {
+      db,
+      verifyToken,
+      requireRole,
+      writeLimiter,
+      bookings,
+      newMeetingUrl,
+      clientUrl: () => normaliseOrigin(process.env.CLIENT_URL),
+      serverUrl: () => normaliseOrigin(process.env.SERVER_PUBLIC_URL || `http://localhost:${port}`),
+      // Defined further down in run(); resolved at request time.
+      updateHospital: (...args) => updateHospital(...args),
+    };
+    routeContext.downloads = createDownloads({ app, db, serverUrl: routeContext.serverUrl });
+    require("./routes/payments")(app, routeContext);
+    require("./routes/ledger")(app, routeContext);
+    require("./routes/prescriptions")(app, routeContext);
+    require("./routes/patient")(app, routeContext);
+    require("./routes/queue")(app, routeContext);
+    require("./routes/analytics")(app, routeContext);
+    require("./routes/emergency")(app, routeContext);
+    require("./routes/hospitalAdmin")(app, routeContext);
+    require("./routes/assistant")(app, routeContext);
+
+    // HOSPITALS (public read, admin write)
+
+    // hospitalId is stored on doctors as a string (same convention as doctorId
+    // on appointments), so lookups compare against the stringified _id.
+    const doctorsOfHospitalLookup = (as, extraStages) => ({
+      $lookup: {
+        from: "doctors",
+        let: { hid: { $toString: "$_id" } },
+        pipeline: [
+          { $match: { $expr: { $eq: ["$hospitalId", "$$hid"] }, approvalStatus: "approved" } },
+          ...extraStages,
+        ],
+        as,
+      },
+    });
+
+    // Without ?page this returns the full array (dropdowns, admin list). With
+    // ?page it returns one page plus the city list for the filter chips.
+    app.get("/hospitals", async (req, res) => {
+      const { city, q } = req.query;
+      const match = {};
+      if (city) match.city = new RegExp(`^${escapeRegex(city)}$`, "i");
+      if (q && String(q).trim()) match.name = new RegExp(escapeRegex(String(q).trim()), "i");
+      if (req.query.emergency === "1") match.emergencyPhone = { $nin: [null, ""] };
+
+      const withCounts = [
+        doctorsOfHospitalLookup("doctorCount", [{ $count: "n" }]),
+        { $addFields: { doctorCount: { $ifNull: [{ $first: "$doctorCount.n" }, 0] } } },
+      ];
+
+      if (req.query.page === undefined) {
+        const result = await hospitalsCollection.aggregate([{ $match: match }, { $sort: { name: 1 } }, ...withCounts]).toArray();
+        return res.json(result);
+      }
+
+      const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+      const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 9));
+      const [[facet], cities] = await Promise.all([
+        hospitalsCollection
+          .aggregate([
+            { $match: match },
+            { $sort: { name: 1 } },
+            {
+              $facet: {
+                hospitals: [{ $skip: (page - 1) * limit }, { $limit: limit }, ...withCounts],
+                total: [{ $count: "n" }],
+              },
+            },
+          ])
+          .toArray(),
+        // (distinct isn't allowed under the Stable API, so group instead)
+        hospitalsCollection
+          .aggregate([
+            ...(req.query.emergency === "1" ? [{ $match: { emergencyPhone: { $nin: [null, ""] } } }] : []),
+            { $group: { _id: "$city" } },
+          ])
+          .toArray()
+          .then((rows) => rows.map((row) => row._id)),
+      ]);
+      const total = facet.total[0]?.n || 0;
+      res.json({
+        hospitals: facet.hospitals,
+        total,
+        page,
+        limit,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+        cities: cities.filter(Boolean).sort(),
+      });
+    });
+
+    app.get("/hospitals/:id", async (req, res) => {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) return res.status(400).json({ message: "Invalid hospital id." });
+
+      const [hospital] = await hospitalsCollection
+        .aggregate([
+          { $match: { _id: new ObjectId(id) } },
+          doctorsOfHospitalLookup("doctors", [
+            { $project: PUBLIC_DOCTOR_PROJECTION },
+            { $sort: { rating: -1, _id: 1 } },
+          ]),
+        ])
+        .toArray();
+      if (!hospital) return res.status(404).json({ message: "Hospital not found." });
+      res.json(hospital);
+    });
+
+    app.post("/admin/hospitals", writeLimiter, verifyToken, requireRole("admin"), async (req, res) => {
+      const fields = pickHospitalFields(req.body);
+      if (!fields.name || !fields.city) {
+        return res.status(400).json({ message: "Hospital name and city are required." });
+      }
+      const result = await hospitalsCollection.insertOne({ ...fields, createdAt: new Date() });
+      res.json(result);
+    });
+
+    // Shared by the admin and (later) the hospital manager, who may only touch
+    // their own hospital.
+    const updateHospital = async (id, body) => {
+      const existing = await hospitalsCollection.findOne({ _id: new ObjectId(id) });
+      if (!existing) return { status: 404, body: { message: "Hospital not found." } };
+
+      const fields = pickHospitalFields(body, { partial: true });
+      // A new cover photo doesn't inherit the old photo's credit.
+      if (fields.image !== undefined && fields.image !== (existing.image || "") && body.imageCredit === undefined) {
+        fields.imageCredit = "";
+        fields.imageSource = "";
+      }
+      if (fields.name === "" || fields.city === "") {
+        return { status: 400, body: { message: "Hospital name and city can't be empty." } };
+      }
+      if (Object.keys(fields).length === 0) {
+        return { status: 400, body: { message: "Nothing to update." } };
+      }
+
+      const result = await hospitalsCollection.updateOne({ _id: existing._id }, { $set: fields });
+      // Doctors carry the hospital name for display/search; keep it in step.
+      if (fields.name && fields.name !== existing.name) {
+        await doctorCollection.updateMany({ hospitalId: id }, { $set: { hospital: fields.name } });
+      }
+      return { status: 200, body: result };
+    };
+
+    app.patch("/admin/hospitals/:id", verifyToken, requireRole("admin"), async (req, res) => {
+      if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ message: "Invalid hospital id." });
+      const { status, body } = await updateHospital(req.params.id, req.body);
+      res.status(status).json(body);
+    });
+
+    app.delete("/admin/hospitals/:id", verifyToken, requireRole("admin"), async (req, res) => {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) return res.status(400).json({ message: "Invalid hospital id." });
+
+      const linked = await doctorCollection.countDocuments({ hospitalId: id });
+      if (linked > 0) {
+        return res.status(409).json({
+          message: `${linked} doctor${linked === 1 ? " is" : "s are"} still linked to this hospital. Move them first.`,
+        });
+      }
+      const result = await hospitalsCollection.deleteOne({ _id: new ObjectId(id) });
+      res.json(result);
+    });
+
+    // Resolves a hospitalId from a form into { hospitalId, hospital } for the
+    // doctor document. Empty means independent / online-only practice.
+    const resolveHospital = async (hospitalId) => {
+      if (!hospitalId) return { value: { hospitalId: null, hospital: "" } };
+      if (!ObjectId.isValid(hospitalId)) return { error: "Invalid hospital selected." };
+      const hospital = await hospitalsCollection.findOne({ _id: new ObjectId(hospitalId) });
+      if (!hospital) return { error: "The selected hospital no longer exists." };
+      return { value: { hospitalId: hospital._id.toString(), hospital: hospital.name } };
+    };
+
     // PUBLIC: Doctors listing / details
-    // ────────────────────────────────────────────────────────────
 
     app.get("/doctors", async (req, res) => {
-      const result = await doctorCollection
-        .find({ approvalStatus: "approved" })
+      const { q, hospital, specialty, sort } = req.query;
+      const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+      const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 12));
+
+      const filter = { approvalStatus: "approved" };
+      const term = typeof q === "string" ? q.trim() : "";
+      if (term) {
+        const rx = new RegExp(escapeRegex(term), "i");
+        filter.$or = [{ name: rx }, { specialty: rx }, { hospital: rx }];
+      }
+      if (hospital === "independent") filter.hospitalId = null;
+      else if (hospital) filter.hospitalId = String(hospital);
+      if (specialty) filter.specialty = new RegExp(`^${escapeRegex(specialty)}$`, "i");
+      if (req.query.type === "online") filter.consultationType = { $in: ["online", "both"] };
+      if (req.query.type === "in-person") filter.consultationType = { $nin: ["online"] };
+
+      const sortSpec = sort === "rating" ? { rating: -1, totalReviews: -1, _id: 1 } : { _id: 1 };
+
+      const [doctors, total] = await Promise.all([
+        doctorCollection
+          .find(filter, { projection: PUBLIC_DOCTOR_PROJECTION })
+          .sort(sortSpec)
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray(),
+        doctorCollection.countDocuments(filter),
+      ]);
+
+      res.json({ doctors, total, page, limit, totalPages: Math.max(1, Math.ceil(total / limit)) });
+    });
+
+    // Homepage numbers + specialty list in one round trip, instead of shipping
+    // every doctor to the browser just to count them.
+    app.get("/doctors/stats", async (req, res) => {
+      const [stats] = await doctorCollection
+        .aggregate([
+          { $match: { approvalStatus: "approved" } },
+          {
+            $facet: {
+              totals: [
+                {
+                  $group: {
+                    _id: null,
+                    totalDoctors: { $sum: 1 },
+                    totalReviews: { $sum: { $ifNull: ["$totalReviews", 0] } },
+                    avgRating: { $avg: "$rating" },
+                  },
+                },
+              ],
+              specialties: [
+                { $match: { specialty: { $nin: [null, ""] } } },
+                { $group: { _id: "$specialty", count: { $sum: 1 } } },
+                { $sort: { _id: 1 } },
+              ],
+              // 5-star quotes for the homepage carousel, minus reviewer emails.
+              testimonials: [
+                { $unwind: "$reviews" },
+                { $match: { "reviews.rating": 5, "reviews.comment": { $nin: [null, ""] } } },
+                { $sort: { "reviews.date": -1 } },
+                { $limit: 12 },
+                {
+                  $project: {
+                    _id: 0,
+                    rating: "$reviews.rating",
+                    comment: "$reviews.comment",
+                    userName: "$reviews.userName",
+                    doctorName: "$name",
+                  },
+                },
+              ],
+            },
+          },
+        ])
         .toArray();
-      res.json(result);
+
+      const totals = stats?.totals?.[0] || {};
+      res.json({
+        totalDoctors: totals.totalDoctors || 0,
+        totalReviews: totals.totalReviews || 0,
+        avgRating: totals.avgRating ? Number(totals.avgRating.toFixed(1)) : null,
+        specialties: (stats?.specialties || []).map((s) => ({ name: s._id, count: s.count })),
+        testimonials: stats?.testimonials || [],
+      });
     });
 
     app.get("/doctors/my-application", verifyToken, async (req, res) => {
@@ -281,22 +589,69 @@ async function run() {
       if (!ObjectId.isValid(id)) {
         return res.status(400).json({ message: "Invalid doctor id." });
       }
-      const result = await doctorCollection.findOne({ _id: new ObjectId(id) });
+      const result = await doctorCollection.findOne({ _id: new ObjectId(id) }, { projection: { credentialImageUrl: 0 } });
+      if (!result) return res.status(404).json({ message: "Doctor not found." });
+      // Reviewer emails are for duplicate checks only, never for other users.
+      result.reviews = (result.reviews || []).map(({ userEmail, ...review }) => review);
       res.json(result);
     });
 
-    // ────────────────────────────────────────────────────────────
+    // Bookable slots for one date. Public (no patient data), never cached.
+    app.get("/doctors/:id/slots", async (req, res) => {
+      const { id } = req.params;
+      const { date, exclude } = req.query;
+      if (!ObjectId.isValid(id)) return res.status(400).json({ message: "Invalid doctor id." });
+      if (!isDate(date)) return res.status(400).json({ message: "Pass ?date=YYYY-MM-DD." });
+
+      const doctor = await doctorCollection.findOne(
+        { _id: new ObjectId(id), approvalStatus: "approved" },
+        { projection: { name: 1, availability: 1, maxPerHour: 1, leaveDates: 1, blockedDates: 1 } }
+      );
+      if (!doctor) return res.status(404).json({ message: "Doctor not found." });
+
+      res.set("Cache-Control", "no-store");
+      const weekday = weekdayOf(date);
+      const base = { date, weekday, slotMinutes: slotMinutesOf(doctor), slots: [] };
+      const now = clinicNow();
+
+      if (date < now.date) return res.json({ ...base, closedReason: "past" });
+      if (leaveDatesOf(doctor).includes(date)) return res.json({ ...base, closedReason: "leave" });
+
+      const slots = daySlots(doctor, weekday);
+      if (slots.length === 0) return res.json({ ...base, closedReason: "not_consulting" });
+
+      await bookings.releaseExpiredHolds();
+      const taken = await appointmentsCollection
+        .find(
+          {
+            doctorId: id,
+            appointmentDate: date,
+            isActive: true,
+            // When rescheduling, the patient's own current slot shows as free.
+            ...(exclude && ObjectId.isValid(exclude) ? { _id: { $ne: new ObjectId(exclude) } } : {}),
+          },
+          { projection: { appointmentTime: 1 } }
+        )
+        .toArray();
+      const takenTimes = new Set(taken.map((a) => a.appointmentTime));
+
+      res.json({
+        ...base,
+        slots: slots.map((s) => ({
+          ...s,
+          available: !takenTimes.has(s.time) && !(date === now.date && s.time <= now.time),
+        })),
+      });
+    });
+
+
     // DOCTOR ONBOARDING (any logged-in user applies)
-    // ────────────────────────────────────────────────────────────
 
     app.post("/doctors/apply", writeLimiter, verifyToken, async (req, res) => {
-      const { degree, registrationNumber, hospital, specialty, credentialImageUrl, bio, fee, image, name, experience, location, phone } = req.body;
+      const { degree, registrationNumber, hospitalId, specialty, credentialImageUrl, bio, fee, image, name, experience, location, phone, consultationType } = req.body;
 
       const existing = await doctorCollection.findOne({ userId: req.user.id });
 
-      // Only block if there's an active (pending) or already-successful
-      // (approved) application. A rejected one can be resubmitted — we
-      // update it in place rather than blocking or creating a duplicate.
       if (existing && existing.approvalStatus !== "rejected") {
         return res.status(400).json({
           message:
@@ -306,26 +661,26 @@ async function run() {
         });
       }
 
-      // Credential document is mandatory — it's the only way an admin can
-      // manually verify this is a real doctor before approving.
       if (!credentialImageUrl) {
         return res.status(400).json({ message: "A credential document is required to apply." });
       }
-      if (!specialty || !degree || !registrationNumber || !hospital || !phone) {
+      if (!specialty || !degree || !registrationNumber || !phone) {
         return res.status(400).json({ message: "Please fill in all required fields." });
       }
 
+      const hospitalPick = await resolveHospital(hospitalId);
+      if (hospitalPick.error) return res.status(400).json({ message: hospitalPick.error });
+
       const doctorFields = {
         userId: req.user.id,
-        // Guaranteed non-null: a doctor doc with no name would crash any UI
-        // that does doctor.name.toLowerCase() (e.g. the search page).
         name: name || req.user.name || req.user.email || "Unnamed Applicant",
         email: req.user.email,
         phone,
         specialty,
         degree,
         registrationNumber,
-        hospital,
+        ...hospitalPick.value,
+        consultationType: CONSULTATION_TYPES.includes(consultationType) ? consultationType : "in-person",
         location: location || "",
         experience: experience || "",
         credentialImageUrl,
@@ -339,8 +694,6 @@ async function run() {
 
       let result;
       if (existing) {
-        // Resubmitting after rejection — update the same document instead
-        // of creating a duplicate, but keep any existing rating/reviews.
         result = await doctorCollection.updateOne(
           { _id: existing._id },
           { $set: doctorFields }
@@ -352,6 +705,8 @@ async function run() {
           totalReviews: 0,
           reviews: [],
           availability: [],
+          maxPerHour: 2,
+          leaveDates: [],
         });
       }
 
@@ -360,7 +715,7 @@ async function run() {
         { $set: { status: "pending" } }
       );
 
-      // Notify every admin so applications don't sit unnoticed.
+      
       const admins = await userCollection.find({ role: "admin" }).toArray();
       for (const admin of admins) {
         await notify({
@@ -379,9 +734,7 @@ async function run() {
       res.json(result);
     });
 
-    // ────────────────────────────────────────────────────────────
     // DOCTOR PANEL (requires role: doctor)
-    // ────────────────────────────────────────────────────────────
 
     const getMyDoctorDoc = (userId) => doctorCollection.findOne({ userId });
 
@@ -395,14 +748,31 @@ async function run() {
       const doctor = await getMyDoctorDoc(req.user.id);
       if (!doctor) return res.status(404).json({ message: "Doctor profile not found" });
 
-      const { bio, fee, image, specialty, hospital, experience, location } = req.body;
+      const { bio, fee, image, specialty, hospitalId, experience, location, consultationType, followUpFeePercent } = req.body;
       const update = {};
       if (bio !== undefined) update.bio = bio;
       if (fee !== undefined) update.fee = fee;
       if (image !== undefined) update.image = image;
       if (specialty !== undefined) update.specialty = specialty;
-      if (hospital !== undefined) update.hospital = hospital;
+      if (hospitalId !== undefined) {
+        const hospitalPick = await resolveHospital(hospitalId);
+        if (hospitalPick.error) return res.status(400).json({ message: hospitalPick.error });
+        Object.assign(update, hospitalPick.value);
+      }
       if (experience !== undefined) update.experience = experience;
+      if (consultationType !== undefined) {
+        if (!CONSULTATION_TYPES.includes(consultationType)) {
+          return res.status(400).json({ message: "Consultation type must be in-person, online or both." });
+        }
+        update.consultationType = consultationType;
+      }
+      if (followUpFeePercent !== undefined) {
+        const pct = Number(followUpFeePercent);
+        if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
+          return res.status(400).json({ message: "Follow-up fee must be between 0% and 100% of the regular fee." });
+        }
+        update.followUpFeePercent = Math.round(pct);
+      }
       if (location !== undefined) update.location = location;
 
       const result = await doctorCollection.updateOne({ _id: doctor._id }, { $set: update });
@@ -413,94 +783,156 @@ async function run() {
       const doctor = await getMyDoctorDoc(req.user.id);
       if (!doctor) return res.status(404).json({ message: "Doctor profile not found" });
 
-      const { availability, blockedDates } = req.body;
+      // `blockedDates` is the old name for leave days; still accepted.
+      const { availability, maxPerHour } = req.body;
+      const leaveInput = req.body.leaveDates ?? req.body.blockedDates;
 
       const update = {};
+      const unset = {};
 
       if (availability !== undefined) {
         if (!Array.isArray(availability)) {
           return res.status(400).json({ message: "availability must be an array." });
         }
-        // Normalise rather than trusting the shape — a malformed entry here
-        // would silently break every booking validation later.
-        update.availability = availability
-          .filter((a) => a && WEEKDAYS.includes(a.day))
-          .map((a) => ({
-            day: a.day,
-            slots: Array.isArray(a.slots)
-              ? [...new Set(a.slots.filter((s) => /^\d{2}:\d{2}$/.test(s)))].sort()
-              : [],
-          }));
+        const days = [];
+        for (const a of availability) {
+          if (!a || !WEEKDAYS.includes(a.day)) continue;
+          const { sessions, error } = normalizeSessions(a.sessions, a.day);
+          if (error) return res.status(400).json({ message: error });
+          days.push({ day: a.day, sessions });
+        }
+        update.availability = days;
       }
 
-      if (blockedDates !== undefined) {
-        if (!Array.isArray(blockedDates)) {
-          return res.status(400).json({ message: "blockedDates must be an array." });
+      if (maxPerHour !== undefined) {
+        if (!PER_HOUR_OPTIONS.includes(Number(maxPerHour))) {
+          return res.status(400).json({ message: `Patients per hour must be one of ${PER_HOUR_OPTIONS.join(", ")}.` });
         }
-        update.blockedDates = [
-          ...new Set(blockedDates.filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d))),
-        ].sort();
+        update.maxPerHour = Number(maxPerHour);
+      }
+
+      let newLeaveDays = [];
+      if (leaveInput !== undefined) {
+        if (!Array.isArray(leaveInput)) {
+          return res.status(400).json({ message: "leaveDates must be an array." });
+        }
+        update.leaveDates = [...new Set(leaveInput.filter(isDate))].sort();
+        unset.blockedDates = "";
+        const before = new Set(leaveDatesOf(doctor));
+        const today = clinicNow().date;
+        newLeaveDays = update.leaveDates.filter((d) => !before.has(d) && d >= today);
       }
 
       if (Object.keys(update).length === 0) {
         return res.status(400).json({ message: "Nothing to update." });
       }
 
-      const result = await doctorCollection.updateOne({ _id: doctor._id }, { $set: update });
-      res.json(result);
+      const result = await doctorCollection.updateOne(
+        { _id: doctor._id },
+        { $set: update, ...(Object.keys(unset).length ? { $unset: unset } : {}) }
+      );
+
+      // Leave over existing bookings: cancel them, refund in full, tell the patients.
+      let cancelledCount = 0;
+      if (newLeaveDays.length > 0) {
+        const affected = await appointmentsCollection
+          .find({
+            doctorId: doctor._id.toString(),
+            appointmentDate: { $in: newLeaveDays },
+            isActive: true,
+            status: { $in: ["pending", "confirmed"] },
+          })
+          .toArray();
+        for (const appt of affected) {
+          const { ok, refund } = await bookings.cancelAppointment(appt, {
+            by: "doctor",
+            reason: "Doctor on leave",
+            refundPercent: 100,
+          });
+          if (!ok) continue;
+          cancelledCount++;
+          const refundText = refund > 0 ? ` Your payment of ৳${refund} will be refunded in full.` : "";
+          await bookings.notifyPatient(appt, {
+            type: "appointment_cancelled_leave",
+            message: `${doctor.name} is on leave on ${appt.appointmentDate}, so your ${appt.appointmentTime} appointment was cancelled.${refundText} Please book another date.`,
+            subject: "Appointment cancelled — doctor on leave",
+          });
+        }
+      }
+
+      res.json({ ...result, cancelledCount });
     });
 
     app.get("/doctor/appointments", verifyToken, requireRole("doctor"), async (req, res) => {
       const doctor = await getMyDoctorDoc(req.user.id);
       if (!doctor) return res.status(404).json({ message: "Doctor profile not found" });
 
+      await bookings.releaseExpiredHolds();
       const result = await appointmentsCollection
-        .find({ doctorId: doctor._id.toString() })
+        .find({ doctorId: doctor._id.toString() }, { projection: { demoPayment: 0, gateway: 0 } })
         .sort({ appointmentDate: -1 })
         .toArray();
       res.json(result);
     });
 
+    const DOCTOR_STATUS_TRANSITIONS = {
+      confirmed: ["pending"],
+      completed: ["confirmed"],
+      cancelled: ["pending", "confirmed"],
+      no_show: ["confirmed"],
+    };
+
     app.patch("/doctor/appointments/:id/status", verifyToken, requireRole("doctor"), async (req, res) => {
       const { id } = req.params;
       const { status } = req.body;
 
-      if (!["confirmed", "cancelled", "completed"].includes(status)) {
+      if (!DOCTOR_STATUS_TRANSITIONS[status]) {
         return res.status(400).json({ message: "Invalid status" });
       }
+      if (!ObjectId.isValid(id)) return res.status(400).json({ message: "Invalid appointment id." });
 
       const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(id) });
       if (!appointment) return res.status(404).json({ message: "Appointment not found" });
 
-      // requireRole("doctor") only proves the caller is *a* doctor. Without
-      // this, any doctor could confirm, cancel or complete another doctor's
-      // appointments just by knowing the id.
       const me = await getMyDoctorDoc(req.user.id);
       if (!me || appointment.doctorId !== me._id.toString()) {
         return res.status(403).json({ message: "This appointment is not yours." });
       }
 
-      const result = await appointmentsCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: { status } }
-      );
-
-      const patient = await userCollection.findOne({ email: appointment.userEmail });
-      if (patient) {
-        await notify({
-          notificationsCollection,
-          userId: patient._id.toString(),
-          type: `appointment_${status}`,
-          message: `Your appointment on ${appointment.appointmentDate} at ${appointment.appointmentTime} was ${status}.`,
-          email: {
-            to: appointment.userEmail,
-            subject: `Appointment ${status} — DocAppoint`,
-            html: `<p>Your appointment on <b>${appointment.appointmentDate}</b> at <b>${appointment.appointmentTime}</b> has been <b>${status}</b>.</p>`,
-          },
-        });
+      const current = appointment.status || "pending";
+      if (!DOCTOR_STATUS_TRANSITIONS[status].includes(current)) {
+        return res.status(400).json({ message: `A ${current} appointment can't be marked ${status.replace("_", "-")}.` });
+      }
+      if (status === "confirmed" && appointment.consultationMode === "online" && appointment.paymentStatus !== "paid") {
+        return res.status(400).json({ message: "Online consultations can be confirmed once the patient has paid." });
+      }
+      if (status === "no_show" && bookings.hoursUntil(appointment) > 0) {
+        return res.status(400).json({ message: "You can mark a no-show only after the appointment time." });
       }
 
-      res.json(result);
+      let refund = 0;
+      if (status === "cancelled") {
+        const outcome = await bookings.cancelAppointment(appointment, {
+          by: "doctor",
+          reason: (req.body.reason || "Cancelled by the doctor").slice(0, 200),
+          refundPercent: (await bookings.getRefundPolicy()).doctorCancelPercent,
+        });
+        if (!outcome.ok) return res.status(409).json({ message: "This appointment was already cancelled." });
+        refund = outcome.refund;
+      } else {
+        await appointmentsCollection.updateOne({ _id: appointment._id }, { $set: { status } });
+      }
+
+      const label = status === "no_show" ? "marked as a no-show" : status;
+      const refundText = refund > 0 ? ` Your payment of ৳${refund} will be refunded in full.` : "";
+      await bookings.notifyPatient(appointment, {
+        type: `appointment_${status}`,
+        message: `Your appointment with ${appointment.doctorName} on ${appointment.appointmentDate} at ${appointment.appointmentTime} was ${label}.${refundText}`,
+        subject: `Appointment ${label} — DocAppoint`,
+        html: `<p>Your appointment with <b>${appointment.doctorName}</b> on <b>${appointment.appointmentDate}</b> at <b>${appointment.appointmentTime}</b> has been <b>${label}</b>.${refundText}</p>`,
+      });
+
+      res.json({ acknowledged: true, status, refund });
     });
 
     app.patch("/doctor/appointments/:id/prescription", verifyToken, requireRole("doctor"), async (req, res) => {
@@ -510,7 +942,6 @@ async function run() {
       const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(id) });
       if (!appointment) return res.status(404).json({ message: "Appointment not found" });
 
-      // A prescription is medical data — only the treating doctor may attach one.
       const me = await getMyDoctorDoc(req.user.id);
       if (!me || appointment.doctorId !== me._id.toString()) {
         return res.status(403).json({ message: "This appointment is not yours." });
@@ -523,12 +954,88 @@ async function run() {
       res.json(result);
     });
 
-    // ────────────────────────────────────────────────────────────
     // APPOINTMENTS (patient-facing)
-    // ────────────────────────────────────────────────────────────
+
+    const PAYMENT_METHODS = ["sslcommerz", "demo_mobile", "cash"];
+    const FOLLOW_UP_WINDOW_DAYS = 14;
+
+    // DA-2026-000123: one counter per year, assigned when the booking is made.
+    const nextReceiptNo = async () => {
+      const year = clinicNow().date.slice(0, 4);
+      const counter = await db
+        .collection("counters")
+        .findOneAndUpdate({ _id: `receipt-${year}` }, { $inc: { seq: 1 } }, { upsert: true, returnDocument: "after" });
+      return `DA-${year}-${String(counter.seq).padStart(6, "0")}`;
+    };
+
+    /**
+     * A follow-up must be for a completed visit of the same patient with the
+     * same doctor that carries a prescription with a follow-up date. Patients
+     * may book from today until 14 days after the visit, or until a week after
+     * the doctor's suggested date if that's later.
+     */
+    const followUpContext = async (parentId, userId) => {
+      if (!ObjectId.isValid(parentId)) return { error: "Invalid follow-up reference." };
+      const parent = await appointmentsCollection.findOne({ _id: new ObjectId(parentId) });
+      if (!parent || parent.userId !== userId) return { error: "Original appointment not found." };
+      if (parent.status !== "completed") return { error: "Follow-ups can be booked after a completed visit." };
+
+      const rx = await db.collection("prescriptions").findOne({ appointmentId: parentId });
+      if (!rx?.followUpDate) return { error: "The doctor didn't ask for a follow-up on this visit." };
+
+      const byVisit = addDays(parent.appointmentDate, FOLLOW_UP_WINDOW_DAYS);
+      const byAdvice = addDays(rx.followUpDate, 7);
+      const window = { start: clinicNow().date, end: byVisit > byAdvice ? byVisit : byAdvice };
+      if (window.end < window.start) return { error: "The follow-up window for this visit has closed." };
+
+      const existing = await appointmentsCollection.findOne({
+        parentAppointmentId: parentId,
+        isActive: true,
+        status: { $in: ["pending", "confirmed"] },
+      });
+      return { parent, rx, window, existing };
+    };
+
+    const followUpFee = (doctor) => {
+      const pct = Number.isFinite(Number(doctor.followUpFeePercent)) ? Number(doctor.followUpFeePercent) : 100;
+      return Math.round(((doctor.fee || 0) * Math.max(0, Math.min(100, pct))) / 100);
+    };
+
+    // Who the appointment is for: the account holder, or one of their family
+    // profiles (looked up server-side — never trusted from the request body).
+    const resolvePatient = async (req) => {
+      const { profileId, patientName, gender, age } = req.body;
+      if (profileId) {
+        const user = await userCollection.findOne(
+          { _id: new ObjectId(req.user.id) },
+          { projection: { profiles: 1 } }
+        );
+        const profile = (user?.profiles || []).find((p) => p.id === profileId);
+        if (!profile) return { error: "That family profile doesn't exist." };
+        return {
+          value: {
+            profileId,
+            patientName: profile.name,
+            gender: profile.gender || "",
+            age: profile.age ?? null,
+            relation: profile.relation || "",
+          },
+        };
+      }
+      const ageNum = Number(age);
+      return {
+        value: {
+          profileId: null,
+          patientName: String(patientName || req.user.name || "").slice(0, 100),
+          gender: String(gender || "").slice(0, 20),
+          age: Number.isFinite(ageNum) && ageNum > 0 && ageNum < 130 ? Math.round(ageNum) : null,
+          relation: "self",
+        },
+      };
+    };
 
     app.post("/appointments", writeLimiter, verifyToken, async (req, res) => {
-      const { doctorId, patientName, gender, phone, appointmentDate, appointmentTime, reason } = req.body;
+      const { doctorId, phone, appointmentDate, appointmentTime, reason, parentAppointmentId } = req.body;
 
       if (!doctorId || !ObjectId.isValid(doctorId)) {
         return res.status(400).json({ message: "A valid doctorId is required." });
@@ -539,144 +1046,342 @@ async function run() {
       if (doctor.approvalStatus && doctor.approvalStatus !== "approved") {
         return res.status(403).json({ message: "This doctor is not accepting bookings yet." });
       }
-
-      const slotError = validateSlot(doctor, appointmentDate, appointmentTime);
-      if (slotError) return res.status(400).json({ message: slotError });
-
-      // Don't let two patients hold the same slot.
-      const clash = await appointmentsCollection.findOne({
-        doctorId,
-        appointmentDate,
-        appointmentTime,
-        status: { $ne: "cancelled" },
-      });
-      if (clash) {
-        return res.status(409).json({ message: "That slot has just been taken. Please pick another." });
+      if (doctor.userId === req.user.id) {
+        return res.status(400).json({ message: "You can't book an appointment with yourself." });
       }
 
-      // Identity comes from the verified JWT, never from the request body —
-      // otherwise a patient could book (and later read) under someone else's
-      // email just by editing the payload.
+      // Visit mode: online-only doctors can't be visited in person and vice versa.
+      const consultationType = doctor.consultationType || "in-person";
+      const mode = req.body.consultationMode === "online" ? "online" : "in-person";
+      if (consultationType !== "both" && consultationType !== mode) {
+        return res.status(400).json({ message: `${doctor.name} only offers ${consultationType} consultations.` });
+      }
+
+      const paymentMethod = PAYMENT_METHODS.includes(req.body.paymentMethod) ? req.body.paymentMethod : null;
+      if (!paymentMethod) return res.status(400).json({ message: "Choose how you'd like to pay." });
+      if (paymentMethod === "cash" && mode === "online") {
+        return res.status(400).json({ message: "Online consultations must be paid in advance." });
+      }
+
+      const slotCheck = validateSlot(doctor, appointmentDate, appointmentTime);
+      if (slotCheck.error) return res.status(400).json({ message: slotCheck.error });
+
+      let amount = doctor.fee || 0;
+      let followUp = null;
+      if (parentAppointmentId) {
+        followUp = await followUpContext(parentAppointmentId, req.user.id);
+        if (followUp.error) return res.status(400).json({ message: followUp.error });
+        if (followUp.parent.doctorId !== doctorId) {
+          return res.status(400).json({ message: "A follow-up has to be with the same doctor." });
+        }
+        if (followUp.existing) return res.status(409).json({ message: "You already have a follow-up booked for this visit." });
+        if (appointmentDate < followUp.window.start || appointmentDate > followUp.window.end) {
+          return res.status(400).json({ message: `Follow-up dates must be between ${followUp.window.start} and ${followUp.window.end}.` });
+        }
+        amount = followUpFee(doctor);
+      }
+
+      const patient = followUp
+        ? {
+            value: {
+              profileId: followUp.parent.profileId || null,
+              patientName: followUp.parent.patientName,
+              gender: followUp.parent.gender || "",
+              age: followUp.parent.age ?? null,
+              relation: followUp.parent.relation || "self",
+            },
+          }
+        : await resolvePatient(req);
+      if (patient.error) return res.status(400).json({ message: patient.error });
+
+      await bookings.releaseExpiredHolds();
+
+      const free = amount <= 0;
+      const online = paymentMethod !== "cash";
       const appointment = {
         userEmail: req.user.email,
         userId: req.user.id,
+        ...patient.value,
+        phone: String(phone || "").slice(0, 30),
         doctorId,
+        doctorUserId: doctor.userId || null,
         doctorName: doctor.name,
-        patientName: patientName || req.user.name,
-        gender: gender || "",
-        phone: phone || "",
+        doctorSpecialty: doctor.specialty || "",
+        hospitalId: doctor.hospitalId || null,
+        hospitalName: doctor.hospital || "",
         appointmentDate,
         appointmentTime,
-        reason: reason || "",
+        serial: slotCheck.serial,
+        slotMinutes: slotMinutesOf(doctor),
+        consultationMode: mode,
+        type: followUp ? "follow-up" : "regular",
+        parentAppointmentId: followUp ? parentAppointmentId : null,
+        reason: String(reason || "").slice(0, 500),
         status: "pending",
+        isActive: true,
+        amount,
+        paymentMethod,
+        paymentStatus: free ? "paid" : "unpaid",
+        transactionId: "",
+        refundedAmount: 0,
+        // Unpaid online payments hold the slot briefly, then release it.
+        holdExpiresAt: online && !free ? new Date(Date.now() + bookings.HOLD_MINUTES * 60 * 1000) : null,
+        rescheduleCount: 0,
+        receiptNo: "",
+        meetingUrl: free && mode === "online" ? newMeetingUrl() : "",
         createdAt: new Date(),
       };
 
-      const result = await appointmentsCollection.insertOne(appointment);
+      let result;
+      try {
+        result = await appointmentsCollection.insertOne(appointment);
+      } catch (err) {
+        if (isDuplicateKey(err)) {
+          return res.status(409).json({ message: "That slot has just been taken. Please pick another." });
+        }
+        throw err;
+      }
+      // Numbered only once the slot is secured, so rejected attempts leave no gaps.
+      appointment.receiptNo = await nextReceiptNo();
+      await appointmentsCollection.updateOne({ _id: result.insertedId }, { $set: { receiptNo: appointment.receiptNo } });
 
-      if (doctor?.userId) {
+      if (doctor.userId) {
         await notify({
           notificationsCollection,
           userId: doctor.userId,
           type: "new_booking",
-          message: `New appointment booked by ${appointment.patientName || appointment.userEmail} on ${appointment.appointmentDate} at ${appointment.appointmentTime}.`,
+          message: `New ${appointment.type === "follow-up" ? "follow-up " : ""}booking: ${appointment.patientName} (serial #${appointment.serial}) on ${appointment.appointmentDate} at ${appointment.appointmentTime}.`,
           email: doctor.email && {
             to: doctor.email,
             subject: "New appointment booked — DocAppoint",
-            html: `<p>You have a new booking from <b>${appointment.patientName || appointment.userEmail}</b> on <b>${appointment.appointmentDate}</b> at <b>${appointment.appointmentTime}</b>.</p>`,
+            html: `<p>You have a new booking from <b>${appointment.patientName}</b> (serial <b>#${appointment.serial}</b>) on <b>${appointment.appointmentDate}</b> at <b>${appointment.appointmentTime}</b>.</p>`,
           },
         });
       }
 
-      res.json(result);
+      res.json({
+        acknowledged: true,
+        insertedId: result.insertedId,
+        serial: appointment.serial,
+        receiptNo: appointment.receiptNo,
+        amount,
+        paymentMethod,
+        paymentStatus: appointment.paymentStatus,
+        holdExpiresAt: appointment.holdExpiresAt,
+        needsPayment: online && !free,
+      });
     });
 
-    // Was unauthenticated and filtered by ?email= from the query string, so
-    // anyone could read any patient's appointment history — medical data —
-    // just by guessing an address. Now it only ever returns the caller's own.
     app.get("/appointments", verifyToken, async (req, res) => {
+      await bookings.releaseExpiredHolds();
       const result = await appointmentsCollection
-        .find({ userEmail: req.user.email })
+        .find({ $or: [{ userId: req.user.id }, { userEmail: req.user.email }] }, { projection: { demoPayment: 0, gateway: 0 } })
         .sort({ createdAt: -1 })
         .toArray();
       res.json(result);
     });
 
-    app.patch("/appointments/:id", verifyToken, async (req, res) => {
+    const loadOwnAppointment = async (req, res) => {
       const { id } = req.params;
-      const existing = await appointmentsCollection.findOne({ _id: new ObjectId(id) });
-      if (!existing) return res.status(404).json({ message: "Appointment not found" });
+      if (!ObjectId.isValid(id)) {
+        res.status(400).json({ message: "Invalid appointment id." });
+        return null;
+      }
+      const appt = await appointmentsCollection.findOne({ _id: new ObjectId(id) });
+      if (!appt) {
+        res.status(404).json({ message: "Appointment not found" });
+        return null;
+      }
+      const owns = appt.userId ? appt.userId === req.user.id : appt.userEmail === req.user.email;
+      if (!owns && req.user.role !== "admin") {
+        res.status(403).json({ message: "This is not your appointment." });
+        return null;
+      }
+      return appt;
+    };
 
-      // Patients may only edit/cancel while it's still pending — once a doctor
-      // has acted on it (confirmed/completed/cancelled), it's locked on their side.
-      // verifyToken only proves *who* you are. Without this, any signed-in user
-      // could reschedule or cancel a stranger's appointment by guessing its id.
-      if (existing.userEmail !== req.user.email && req.user.role !== "admin") {
+    app.get("/appointments/:id", verifyToken, async (req, res) => {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) return res.status(400).json({ message: "Invalid appointment id." });
+      await bookings.releaseExpiredHolds();
+      const appt = await appointmentsCollection.findOne({ _id: new ObjectId(id) }, { projection: { demoPayment: 0, gateway: 0 } });
+      if (!appt) return res.status(404).json({ message: "Appointment not found" });
+      const isPatient = appt.userId ? appt.userId === req.user.id : appt.userEmail === req.user.email;
+      const isDoctor = appt.doctorUserId && appt.doctorUserId === req.user.id;
+      if (!isPatient && !isDoctor && req.user.role !== "admin") {
         return res.status(403).json({ message: "This is not your appointment." });
       }
-
-      if (existing.status && existing.status !== "pending") {
-        return res.status(403).json({ message: "This appointment can no longer be edited." });
-      }
-
-      const allowed = {};
-      const newDate = req.body.appointmentDate ?? existing.appointmentDate;
-      const newTime = req.body.appointmentTime ?? existing.appointmentTime;
-
-      if (req.body.appointmentDate !== undefined || req.body.appointmentTime !== undefined) {
-        const doctor = await doctorCollection.findOne({ _id: new ObjectId(existing.doctorId) });
-        if (!doctor) return res.status(404).json({ message: "Doctor not found." });
-
-        // Rescheduling has to respect availability exactly like booking does.
-        const slotError = validateSlot(doctor, newDate, newTime);
-        if (slotError) return res.status(400).json({ message: slotError });
-
-        const clash = await appointmentsCollection.findOne({
-          _id: { $ne: new ObjectId(id) },
-          doctorId: existing.doctorId,
-          appointmentDate: newDate,
-          appointmentTime: newTime,
-          status: { $ne: "cancelled" },
-        });
-        if (clash) {
-          return res.status(409).json({ message: "That slot is already taken. Please pick another." });
-        }
-
-        allowed.appointmentDate = newDate;
-        allowed.appointmentTime = newTime;
-      }
-
-      if (req.body.status === "cancelled") allowed.status = "cancelled";
-
-      const result = await appointmentsCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: allowed }
-      );
-      res.json(result);
+      res.set("Cache-Control", "no-store");
+      res.json(appt);
     });
 
-    app.delete("/appointments/:id", verifyToken, async (req, res) => {
-      const { id } = req.params;
-      const existing = await appointmentsCollection.findOne({ _id: new ObjectId(id) });
-      if (!existing) return res.status(404).json({ message: "Appointment not found" });
+    // Follow-up booking details for a completed visit (prefill + date window).
+    app.get("/appointments/:id/follow-up", verifyToken, async (req, res) => {
+      const ctx = await followUpContext(req.params.id, req.user.id);
+      if (ctx.error) return res.status(400).json({ message: ctx.error });
+      const doctor = await doctorCollection.findOne({ _id: new ObjectId(ctx.parent.doctorId) });
+      if (!doctor) return res.status(404).json({ message: "Doctor not found." });
+      res.json({
+        parentAppointmentId: req.params.id,
+        doctorId: ctx.parent.doctorId,
+        followUpDate: ctx.rx.followUpDate,
+        window: ctx.window,
+        fee: followUpFee(doctor),
+        regularFee: doctor.fee || 0,
+        alreadyBooked: Boolean(ctx.existing),
+        patient: {
+          profileId: ctx.parent.profileId || null,
+          patientName: ctx.parent.patientName,
+          gender: ctx.parent.gender || "",
+          age: ctx.parent.age ?? null,
+          phone: ctx.parent.phone || "",
+        },
+      });
+    });
 
-      if (existing.userEmail !== req.user.email && req.user.role !== "admin") {
-        return res.status(403).json({ message: "This is not your appointment." });
+    // Reschedule: free once by default (keeps the payment), only before the
+    // visit starts. The doctor has to confirm the new time again.
+    app.patch("/appointments/:id", verifyToken, async (req, res) => {
+      const existing = await loadOwnAppointment(req, res);
+      if (!existing) return;
+
+      if (req.body.status === "cancelled") {
+        return res.status(400).json({ message: "Use the cancel action to cancel an appointment." });
       }
+      if (!["pending", "confirmed"].includes(existing.status || "pending") || existing.isActive === false) {
+        return res.status(403).json({ message: "This appointment can no longer be changed." });
+      }
+      if (bookings.hoursUntil(existing) <= 0) {
+        return res.status(403).json({ message: "This appointment has already started." });
+      }
+
+      const newDate = req.body.appointmentDate ?? existing.appointmentDate;
+      const newTime = req.body.appointmentTime ?? existing.appointmentTime;
+      if (newDate === existing.appointmentDate && newTime === existing.appointmentTime) {
+        return res.status(400).json({ message: "Pick a different date or time." });
+      }
+
+      const policy = await bookings.getRefundPolicy();
+      if ((existing.rescheduleCount || 0) >= policy.freeReschedules && req.user.role !== "admin") {
+        return res.status(403).json({
+          message: `You've used your free reschedule${policy.freeReschedules === 1 ? "" : "s"}. Cancel and book again instead.`,
+        });
+      }
+
+      const doctor = await doctorCollection.findOne({ _id: new ObjectId(existing.doctorId) });
+      if (!doctor) return res.status(404).json({ message: "Doctor not found." });
+
+      const slotCheck = validateSlot(doctor, newDate, newTime);
+      if (slotCheck.error) return res.status(400).json({ message: slotCheck.error });
+
+      if (existing.type === "follow-up" && existing.parentAppointmentId) {
+        const ctx = await followUpContext(existing.parentAppointmentId, existing.userId);
+        if (!ctx.error && (newDate < ctx.window.start || newDate > ctx.window.end)) {
+          return res.status(400).json({ message: `Follow-up dates must be between ${ctx.window.start} and ${ctx.window.end}.` });
+        }
+      }
+
+      await bookings.releaseExpiredHolds();
+      try {
+        await appointmentsCollection.updateOne(
+          { _id: existing._id },
+          {
+            $set: {
+              appointmentDate: newDate,
+              appointmentTime: newTime,
+              serial: slotCheck.serial,
+              slotMinutes: slotMinutesOf(doctor),
+              status: "pending",
+              queueNotified: false,
+            },
+            $inc: { rescheduleCount: 1 },
+          }
+        );
+      } catch (err) {
+        if (isDuplicateKey(err)) return res.status(409).json({ message: "That slot is already taken. Please pick another." });
+        throw err;
+      }
+
+      await bookings.notifyDoctor(existing, {
+        type: "appointment_rescheduled",
+        message: `${existing.patientName} moved their appointment from ${existing.appointmentDate} ${existing.appointmentTime} to ${newDate} ${newTime} (serial #${slotCheck.serial}). Please confirm the new time.`,
+      });
+
+      res.json({ acknowledged: true, appointmentDate: newDate, appointmentTime: newTime, serial: slotCheck.serial });
+    });
+
+    // What cancelling now would refund — shown before the patient confirms.
+    app.get("/appointments/:id/cancel-preview", verifyToken, async (req, res) => {
+      const appt = await loadOwnAppointment(req, res);
+      if (!appt) return;
+      const policy = await bookings.getRefundPolicy();
+      const by = req.user.role === "admin" ? "admin" : "patient";
+      const percent = bookings.refundPercentFor(appt, by, policy);
+      const refundable = bookings.refundableAmount(appt);
+      res.json({
+        refundPercent: percent,
+        refundAmount: Math.min(refundable, Math.round(((appt.amount || 0) * percent) / 100)),
+        paid: refundable,
+        hoursUntil: Math.round(bookings.hoursUntil(appt) * 10) / 10,
+        policy,
+      });
+    });
+
+    app.post("/appointments/:id/cancel", writeLimiter, verifyToken, async (req, res) => {
+      const appt = await loadOwnAppointment(req, res);
+      if (!appt) return;
+      if (!["pending", "confirmed"].includes(appt.status || "pending") || appt.isActive === false) {
+        return res.status(400).json({ message: "Only upcoming appointments can be cancelled." });
+      }
+
+      const policy = await bookings.getRefundPolicy();
+      const by = req.user.role === "admin" ? "admin" : "patient";
+      const outcome = await bookings.cancelAppointment(appt, {
+        by,
+        reason: String(req.body.reason || "").slice(0, 200),
+        refundPercent: bookings.refundPercentFor(appt, by, policy),
+      });
+      if (!outcome.ok) return res.status(409).json({ message: "This appointment was already cancelled." });
+
+      await bookings.notifyDoctor(appt, {
+        type: "appointment_cancelled",
+        message: `${appt.patientName} cancelled their appointment on ${appt.appointmentDate} at ${appt.appointmentTime} (serial #${appt.serial ?? "—"}).`,
+      });
+      if (outcome.refund > 0) {
+        await bookings.notifyPatient(appt, {
+          type: "refund_issued",
+          message: `৳${outcome.refund} (${outcome.percent}%) will be refunded for your cancelled appointment with ${appt.doctorName}.`,
+          subject: "Refund issued — DocAppoint",
+        });
+      }
+      res.json({ acknowledged: true, refund: outcome.refund, refundPercent: outcome.percent });
+    });
+
+    // Hard delete is only for bookings where no money ever moved; anything
+    // paid goes through cancel so the ledger stays complete.
+    app.delete("/appointments/:id", verifyToken, async (req, res) => {
+      const existing = await loadOwnAppointment(req, res);
+      if (!existing) return;
 
       if (existing.status && existing.status !== "pending") {
         return res.status(403).json({ message: "This appointment can no longer be deleted." });
       }
+      if (["paid", "partially_refunded", "refunded", "pending"].includes(existing.paymentStatus)) {
+        return res.status(403).json({ message: "Paid appointments can't be deleted — cancel it instead." });
+      }
 
-      const result = await appointmentsCollection.deleteOne({ _id: new ObjectId(id) });
+      const result = await appointmentsCollection.deleteOne({ _id: existing._id });
       res.json(result);
     });
 
     app.patch("/doctors/:id/review", writeLimiter, verifyToken, async (req, res) => {
       const { id } = req.params;
-      const { rating, comment } = req.body;
+      const { rating, comment, appointmentId } = req.body;
 
       if (!ObjectId.isValid(id)) return res.status(400).json({ message: "Invalid doctor id." });
+      if (!appointmentId || !ObjectId.isValid(appointmentId)) {
+        return res.status(400).json({ message: "Choose which visit you're reviewing." });
+      }
 
       const score = Number(rating);
       if (!Number.isInteger(score) || score < 1 || score > 5) {
@@ -686,28 +1391,27 @@ async function run() {
       const doctor = await doctorCollection.findOne({ _id: new ObjectId(id) });
       if (!doctor) return res.status(404).json({ message: "Doctor not found." });
 
-      // Identity from the token, not the body — otherwise anyone could post a
-      // review under another person's name and email.
       const userEmail = req.user.email;
       const userName = req.user.name || userEmail;
 
-      // You may only review a doctor you've actually completed a visit with.
-      const visited = await appointmentsCollection.findOne({
-        doctorId: id,
-        userEmail,
-        status: "completed",
-      });
-      if (!visited) {
+      // One review per appointment, and only for the patient's own completed visit
+      // with this doctor. Claiming the appointment first makes double submits safe.
+      const visit = await appointmentsCollection.findOneAndUpdate(
+        {
+          _id: new ObjectId(appointmentId),
+          doctorId: id,
+          userId: req.user.id,
+          status: "completed",
+          reviewed: { $ne: true },
+        },
+        { $set: { reviewed: true } }
+      );
+      if (!visit) {
+        const existing = await appointmentsCollection.findOne({ _id: new ObjectId(appointmentId), userId: req.user.id });
+        if (existing?.reviewed) return res.status(409).json({ message: "You've already reviewed this visit." });
         return res.status(403).json({ message: "You can only review a doctor after a completed appointment." });
       }
 
-      if ((doctor.reviews || []).some((r) => r.userEmail === userEmail)) {
-        return res.status(409).json({ message: "You have already reviewed this doctor." });
-      }
-
-      // Proper running mean. The old formula was (current + new) / 2, which
-      // weighted the newest review at 50% no matter how many came before —
-      // one 1-star review could halve a long-standing 5.0.
       const prevTotal = doctor.totalReviews || 0;
       const prevRating = doctor.rating || 0;
       const newTotalReviews = prevTotal + 1;
@@ -721,6 +1425,7 @@ async function run() {
           $set: { rating: newRating, totalReviews: newTotalReviews },
           $push: {
             reviews: {
+              appointmentId,
               userName,
               userEmail,
               rating: score,
@@ -733,9 +1438,7 @@ async function run() {
       res.json(result);
     });
 
-    // ────────────────────────────────────────────────────────────
-    // ADMIN PANEL (requires role: admin)
-    // ────────────────────────────────────────────────────────────
+    // ADMIN PANEL (requires role: admin)    
 
     app.get("/admin/doctors/pending", verifyToken, requireRole("admin"), async (req, res) => {
       const result = await doctorCollection.find({ approvalStatus: "pending" }).toArray();
@@ -810,7 +1513,7 @@ async function run() {
       const { role } = req.query;
       const query = role ? { role } : {};
       const result = await userCollection
-        .find(query, { projection: { name: 1, email: 1, role: 1, status: 1, createdAt: 1 } })
+        .find(query, { projection: { name: 1, email: 1, role: 1, status: 1, createdAt: 1, hospitalId: 1 } })
         .toArray();
       res.json(result);
     });
@@ -843,9 +1546,7 @@ async function run() {
       res.json({ totalPatients, totalDoctors, pendingDoctors, totalAppointments });
     });
 
-    // ────────────────────────────────────────────────────────────
     // NOTIFICATIONS (any authenticated user, own notifications only)
-    // ────────────────────────────────────────────────────────────
 
     app.get("/notifications", verifyToken, async (req, res) => {
       const result = await notificationsCollection
@@ -873,6 +1574,17 @@ async function run() {
       res.json(result);
     });
 
+    // Registered last so they sit after every route added above; Express only
+    // hands errors to error middleware that comes later in the stack.
+    app.use((req, res) => res.status(404).json({ message: "Not found." }));
+    app.use((err, req, res, next) => {
+      console.error("Unhandled error on", req.method, req.originalUrl, ":", err.message);
+      if (res.headersSent) return next(err);
+      res.status(err.status || 500).json({
+        message: err.publicMessage || "Something went wrong on the server. Please try again.",
+      });
+    });
+
     console.log("Pinged your deployment. You successfully connected to MongoDB!");
   } finally {
     // await client.close();
@@ -884,19 +1596,6 @@ app.get("/", (req, res) => {
   res.send("DocAppoint API is running.");
 });
 
-// Global error handler — MUST be registered last, after all routes.
-// Anything that throws or rejects inside a route (bad ObjectId, DB hiccup,
-// a bug we haven't found yet) lands here instead of crashing the whole
-// server. This is the safety net; individual routes should still validate
-// input where practical, but this guarantees a bad request degrades to a
-// clean error response instead of taking down every other user's session.
-app.use((err, req, res, next) => {
-  console.error("Unhandled error on", req.method, req.originalUrl, ":", err.message);
-  if (res.headersSent) return next(err);
-  res.status(err.status || 500).json({
-    message: err.publicMessage || "Something went wrong on the server. Please try again.",
-  });
-});
 
 app.listen(port, () => {
   console.log(`DocAppoint server listening on port ${port}`);
